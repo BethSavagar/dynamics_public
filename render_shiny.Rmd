@@ -1,0 +1,248 @@
+---
+title: "Rshiny"
+author: "Beth Savagar"
+date: "2024-04-08"
+output: html_document
+---
+
+# Flock immunity levels following vaccination:
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r funcs}
+
+filepath <- ""
+
+## Libraries
+library(tidyverse)
+library(readr)
+
+## Functions:
+source(paste0(filepath, "shiny_functions/wrapper_shiny.R")) # wrapper function
+source(paste0(filepath, "shiny_functions/summarydf_shiny.R")) # summary stats for output
+source(paste0(filepath, "shiny_functions/dynmod_shiny.R")) # flock dynamics model function
+source(paste0(filepath, "shiny_functions/output.R")) # what to include in output df
+# source(paste0(filepath, "functions/GSA_outputs.R")) # summary stats accounting for vac
+
+```
+
+```{r customplot}
+# custom plot theme
+custom_theme <- theme_bw() + 
+  theme(text = element_text(family = "Times New Roman", size = 10),
+        panel.grid.minor = element_blank())
+theme_set(custom_theme)
+```
+
+```{r selectData}
+
+## Load demographic parameters dataframe:
+datafile1 <- "user_demographic-pars.csv"
+demographics_df <- read_csv(paste0("shiny_parameters/",datafile1))
+
+datafile2 <- "user_model-pars.csv"
+modpars_df <- read_csv(paste0("shiny_parameters/",datafile2))
+
+datafile3 <- "user_vaccination-pars.csv"
+vacpars_df <- read_csv(paste0("shiny_parameters/",datafile3))
+
+# Load immunity decay data:
+imm_decay_corrected <- read_csv("shiny_parameters/imm_decay_bodjo_v2.csv")
+
+```
+# Model Setup Parameters:
+
+```{r modSetup}
+
+######################
+## MODEL SETUP ##
+######################
+
+timestop <- modpars_df %>% filter(parameter == "timestop") %>% pull(default) %>% as.numeric()
+## Simulation:
+TimeStop_dynamics <- timestop*52 # 2 years only interested in rates for 1 y
+
+# Output options: "summary" (stats with age-group prop), "summary_all" (stats with age-sex group prop), "dynamics" (pop metrics over time)
+output <- modpars_df %>% filter(parameter == "output") %>% pull(default) 
+output <- "dynamics"
+
+# create empty dataframe to store output
+summary_df <- output_func(TimeStop_dynamics, output) 
+
+```
+
+# Birth Pattern Parameters:
+
+```{r birthpattern}
+
+##################################
+## BIRTH PEAKS  ##
+##################################
+# pre-processing reproduction parameters for input into model:
+
+# Are births seasonal?
+seasonal_raw <-
+  modpars_df %>% filter(parameter == "seasonal") %>% pull(default)
+if (seasonal_raw == "Y") {
+  seasonal <- T
+} else if (seasonal_raw == "N") {
+  seasonal <- F
+}
+
+if (seasonal) {
+  # Duration of birth peak, weeks (i.e. 2 months = 8weeks)
+  npeak_wks <- demographics_df %>% filter(parameter == "peak_wks") %>% pull(default)
+  # Month birth peak occurs:
+  peakmnth <- demographics_df %>% filter(parameter == "peakmnth") %>% pull(default) %>% as.numeric()
+  
+  # Number weeks of the year:
+  wkmnthids <- data.frame(mnth = 1:12,
+                          mnthwk = seq(1, 53, by = 4.345) %>% round())
+  
+  # Week peak starts:
+  peakstart <- wkmnthids %>% filter(mnth == peakmnth) %>% pull()
+  pkwk1 <- seq(from = peakstart,
+               by = 1,
+               length.out = npeak_wks)
+  
+  # Vector containing number id of weeks births occur:
+  birthpeak_w <- c()
+  for (i in 1:timestop - 1) {
+    seqjump <- i * 52
+    pkwki <- pkwk1 + seqjump
+    birthpeak_w <- c(birthpeak_w, pkwki)
+  }
+} else{
+  birthpeak_w <- NA
+}
+
+
+```
+
+Vaccination simulations:
+
+```{r vaccinationSchedule}
+
+# Proportion animals vaccinated each round:
+pV <- vacpars_df %>% filter(parameter == "prop_vaccinated") %>% pull(default) %>% as.numeric()
+
+# Years of vaccination:
+V_years <- vacpars_df %>% filter(parameter == "years_vaccination") %>% pull(default) %>% as.numeric()
+
+# Interval between vaccination rounds
+# - 6 or 12months for non-seasonal reproduction
+V_breaks_raw <- vacpars_df %>% filter(parameter == "interval") %>% pull(default) %>% as.numeric()
+# - Only 12 month intervals for seasonal reproduction
+if(seasonal){
+  V_breaks_raw <- 12
+}
+# Intervals between vaccination in weeks:
+V_breaks <- round(V_breaks_raw*4.345) 
+
+# Number of rounds of vaccination (i.e. programme duration / vaccination interval)
+V_rounds <- V_years*52 / V_breaks
+
+# Min age of vaccination:
+V_min_raw <- vacpars_df %>% filter(parameter == "V_min") %>% pull(default) %>% as.numeric()
+V_age_min <- round(V_min_raw *4.345,0) # 4 months (4.345 weeks per month)
+# Max age of vaccination if partial vaccination:
+V_age_max <- round(12 *4.345,0) # 12 months (4.345 weeks per month) for partial campaigns, as per GSCE
+
+## VACCINATION SCHEDULE:
+# vaccination starts at halfway point of simulation
+V1 <- 0.5*TimeStop_dynamics # first vaccination campaign
+V_starts <- vector(length=V_rounds) # vector for containing start weeks for vaccination
+for(v in 1:V_rounds){
+  V_starts[v] <- V1+(v-1)*V_breaks
+}
+
+# FULL PROGRAMME: 
+
+if(V_breaks_raw == 12){
+  Vprog <- data.frame(
+    Vround = 1:4, # max 4 campaigns
+    Vtype = c("full","full","partial", "partial"),
+    Vweek = V_starts,
+    Vmin = V_age_min,
+    Vmax = V_age_max,
+    pV = pV) %>%
+    mutate(Vmax = if_else(Vtype == "full", NA, Vmax))
+}else if(V_breaks_raw == 6){
+  Vprog <- data.frame(
+    Vround = 1:8, # max 8 campaigns
+    Vtype = c("full","full","full","full","partial", "partial","partial", "partial"),
+    Vweek = V_starts,
+    Vmin = V_age_min,
+    Vmax = V_age_max,
+    pV = pV) %>%
+    mutate(Vmax = if_else(Vtype == "full", NA, Vmax))
+}
+
+Vprog <- Vprog %>% slice(1:V_rounds)
+Vstart <- Vprog %>% filter(Vround==1) %>% pull(Vweek)
+
+```
+
+
+# Simulate full immunity dynamics following vaccination for all OC profiles with non-seasonal reproduction
+
+```{r runMod}
+
+dynamics <- dynmod_wrapper(
+    imm_decay_corrected, # immunity decay rate df (fixed)
+    demographics_df, # demographic data defined by the user
+    TimeStop_dynamics, # duration of simulation weekly timestep for demographic component
+    output, # type of model output: tracker or summary stats
+    summary_df, # dataframe for storing output
+    Vstart, # Start of vaccination campaign (week)
+    Vprog, # Vaccination programme df 
+    birthpeak_w, # weeks of birth peak
+    seasonal
+)
+```
+
+
+```{r output}
+
+dyn_plot <- dynamics %>%
+  filter(w>=V_starts[1]) %>% 
+  mutate(Vweeks = (w/52)-10)
+
+ggplot(dyn_plot) +
+  geom_line(aes(x=Vweeks, y = prop_immune))+
+  geom_hline(yintercept = 0.7, linetype = "dashed", col = "grey")+
+  coord_cartesian(xlim = c(NA, 4.5))+
+  labs(x="Time post-vaccination (years)", y = "Flock proportion immune", col = "Vaccination Coverage")
+
+# Weeks with immunity >70%
+
+# Proportion of programme with immunity >70%
+
+```
+############
+
+
+<!-- ```{r animweeksimmune} -->
+
+<!-- # Constants -->
+<!-- total_weeks_5_years <- 52 * 5 -->
+
+<!-- # Example Dataframe -->
+<!-- # df <- data.frame(Area_ID = 1:100, Population = runif(100, 100, 500), Proportion_Low_Immunity = runif(100, 0, 1)) -->
+
+<!-- # Calculate the number of weeks with low immunity -->
+<!-- df$Weeks_Low_Immunity <- df$Proportion_Low_Immunity * total_weeks_5_years -->
+
+<!-- # Calculate animal-weeks with immunity <70% -->
+<!-- df$Animal_Weeks_Low_Immunity <- df$Population * df$Weeks_Low_Immunity -->
+
+<!-- # Calculate total animal-weeks for all areas -->
+<!-- total_animal_weeks_low_immunity <- sum(df$Animal_Weeks_Low_Immunity) -->
+
+<!-- # Output the result -->
+<!-- print(total_animal_weeks_low_immunity) -->
+
+
+<!-- ``` -->

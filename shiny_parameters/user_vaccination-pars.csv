@@ -1,0 +1,5 @@
+﻿parameter,default
+prop_vaccinated,1
+years_vaccination,4
+interval,12
+V_min,4

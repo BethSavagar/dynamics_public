@@ -1,0 +1,4 @@
+﻿parameter,default
+timestop,20
+seasonal,Y
+output,dynamics
